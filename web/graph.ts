@@ -1,321 +1,424 @@
 const CLASS_GRAPH_VERTEX_ACTIVE = 'graphVertexActive';
 const NULL_VERTEX_ID = -1;
-
+const DEFAULT_COLOUR = '#808080';
 
 /* Types */
 
 interface Point {
-	readonly x: number;
-	readonly y: number;
-}
-interface Line {
-	readonly p1: Point;
-	readonly p2: Point;
-	readonly lockedFirst: boolean; // TRUE => The line is locked to p1, FALSE => The line is locked to p2
-}
-
-interface Pixel {
 	x: number;
 	y: number;
 }
-interface PlacedLine {
-	readonly p1: Pixel;
-	readonly p2: Pixel;
-	readonly isCommitted: boolean;
-	readonly lockedFirst: boolean; // TRUE => The line is locked to p1, FALSE => The line is locked to p2
+interface Line {
+	p1: Point;
+	p2: Point;
+	curveTiming: CurveTiming;
+	isCommitted: boolean;
+	colour: string;
 }
-
-interface UnavailablePoint {
-	readonly connectsTo: VertexOrNull;
-	readonly onBranch: Branch;
+enum CurveTiming {
+	NoCurve = 0,
+	CurveLast = 1,
+	CurveFirst = 2
 }
-
-type VertexOrNull = Vertex | null;
-
 
 /* Branch Class */
 
-class Branch {
-	private readonly colour: number;
-	private end: number = 0;
+
+// The Branch2 class represents a particular "channel" in the graph, which is denoted by the 'x' variable.
+// This way, we can modify the priority of this "channel".
+// The original Branch class doesn't do this, and instead, holds the rendering
+// information of where and how to draw lines. This meant my initial attempts
+// of prioritising "branches" failed, because I would always get weird connections...
+// This way, we can prioritise which channel each commit goes into, and then only
+// the commit is responsible for drawing dots and lines
+class Branch2 {
+	public readonly name: string;
+	public tip: Commit2;
+	public branchToFollow: Branch2 | null = null;
+	public isPriority: boolean = false;
+
+	private _x: number;
+
 	private lines: Line[] = [];
-	private numUncommitted: number = 0;
 
-	constructor(colour: number) {
-		this.colour = colour;
+	constructor(x: number, name: string, tip: Commit2) {
+		this._x = x;
+		this.name = name;
+		this.tip = tip;
 	}
 
-	public addLine(p1: Point, p2: Point, isCommitted: boolean, lockedFirst: boolean) {
-		this.lines.push({ p1: p1, p2: p2, lockedFirst: lockedFirst });
-		if (isCommitted) {
-			if (p2.x === 0 && p2.y < this.numUncommitted) this.numUncommitted = p2.y;
-		} else {
-			this.numUncommitted++;
+	get x(): number {
+		if (this.branchToFollow !== null && this.branchToFollow !== this) return this.branchToFollow.x;
+		return this._x;
+	}
+	set x(x) {
+		this._x = x;
+	}
+
+	get isRemote() {
+		return this.name.includes('/');
+	}
+	get branchName() {
+		let parts = this.name.split('/');
+		return parts[parts.length - 1];
+	}
+	get remoteName(): string | null {
+		let parts = this.name.split('/');
+		if (parts.length === 1) return null;
+		return parts[0];
+	}
+
+	/**
+	 * Uses the Breadth-First Search algorithm to find if the passed branch is a direct ancestor
+	 * of this branch (ie, the two branches DON'T diverge from a common ancestor).
+	 *
+	 * @param branch The branch to look for
+	 * @returns True if the passed branch is a direct ancestor of this branch
+	 */
+	public isDirectAncestor(branch: Branch2): boolean {
+		let queue = [this.tip];
+		let commit;
+		while (queue.length > 0) {
+			commit = queue.shift()!;
+			if (commit.definedHeads.has(branch)) return true; // If defined has it, then we're an ancestor
+			if (commit.inferredHeads.has(branch)) return false; // If inferred has it, we likely came from a merge
+			queue.push(...commit.getParents());
 		}
+		return false;
 	}
 
-
-	/* Get / Set */
-
-	public getColour() {
-		return this.colour;
+	public setPriority(priorities: string[]) {
+		this.x = priorities.indexOf(this.name);
+		if (this.x !== -1) this.isPriority = true;
+		else this.isPriority = false;
 	}
-
-	public getEnd() {
-		return this.end;
-	}
-
-	public setEnd(end: number) {
-		this.end = end;
-	}
-
-
-	/* Rendering */
 
 	public draw(svg: SVGElement, config: GG.GraphConfig, expandAt: number) {
-		let colour = config.colours[this.colour % config.colours.length], i, x1, y1, x2, y2, lines: PlacedLine[] = [], curPath = '', d = config.grid.y * (config.style === GG.GraphStyle.Angular ? 0.38 : 0.8), line, nextLine;
+		this.buildLines(config);
 
-		// Convert branch lines into pixel coordinates, respecting expanded commit extensions
-		for (i = 0; i < this.lines.length; i++) {
-			line = this.lines[i];
-			x1 = line.p1.x * config.grid.x + config.grid.offsetX; y1 = line.p1.y * config.grid.y + config.grid.offsetY;
-			x2 = line.p2.x * config.grid.x + config.grid.offsetX; y2 = line.p2.y * config.grid.y + config.grid.offsetY;
+		let p1: Point; // Source
+		let p2: Point; // Dest
+		let p3: Point; // Collision Move-To Point
+		let screenLines: Line[] = [];
+		let curLine: Line | undefined;
 
-			// If a commit is expanded, we need to stretch the graph for the height of the commit details view
+		// First passthrough creates screenLines from this.lines
+		// It also simplifies consecutive straight lines
+		for (let i = 0; i < this.lines.length; i++) {
+			curLine = this.lines[i];
+
+			p1 = { x: curLine.p1.x * config.grid.x + config.grid.offsetX, y: curLine.p1.y * config.grid.y + config.grid.offsetY };
+			p2 = { x: curLine.p2.x * config.grid.x + config.grid.offsetX, y: curLine.p2.y * config.grid.y + config.grid.offsetY };
+
 			if (expandAt > -1) {
-				if (line.p1.y > expandAt) { // If the line starts after the expansion, move the whole line lower
-					y1 += config.grid.expandY;
-					y2 += config.grid.expandY;
-				} else if (line.p2.y > expandAt) { // If the line crosses the expansion
-					if (x1 === x2) { // The line is vertical, extend the endpoint past the expansion
-						y2 += config.grid.expandY;
-					} else if (line.lockedFirst) { // If the line is locked to the first point, the transition stays in its normal position
-						lines.push({ p1: { x: x1, y: y1 }, p2: { x: x2, y: y2 }, isCommitted: i >= this.numUncommitted, lockedFirst: line.lockedFirst }); // Display the normal transition
-						lines.push({ p1: { x: x2, y: y1 + config.grid.y }, p2: { x: x2, y: y2 + config.grid.expandY }, isCommitted: i >= this.numUncommitted, lockedFirst: line.lockedFirst }); // Extend the line over the expansion from the transition end point
-						continue;
-					} else { // If the line is locked to the second point, the transition moves to after the expansion
-						lines.push({ p1: { x: x1, y: y1 }, p2: { x: x1, y: y2 - config.grid.y + config.grid.expandY }, isCommitted: i >= this.numUncommitted, lockedFirst: line.lockedFirst }); // Extend the line over the expansion to the new transition start point
-						y1 += config.grid.expandY; y2 += config.grid.expandY;
-					}
+				if (curLine.p1.y > expandAt) { // If the line starts after the expansion, move the whole line lower
+					p1.y += config.grid.expandY;
+					p2.y += config.grid.expandY;
+				} else if (curLine.p2.y > expandAt) { // If it's just the end, only move the end
+					p2.y += config.grid.expandY;
 				}
+				// I wasn't sure how "locking" fit into the mix...
 			}
-			lines.push({ p1: { x: x1, y: y1 }, p2: { x: x2, y: y2 }, isCommitted: i >= this.numUncommitted, lockedFirst: line.lockedFirst });
+
+			screenLines.push({ p1, p2, curveTiming: curLine.curveTiming, isCommitted: curLine.isCommitted, colour: curLine.colour });
 		}
 
-		// Simplify consecutive lines that are straight by removing the 'middle' point
-		i = 0;
-		while (i < lines.length - 1) {
-			line = lines[i];
-			nextLine = lines[i + 1];
-			if (line.p1.x === line.p2.x && line.p2.x === nextLine.p1.x && nextLine.p1.x === nextLine.p2.x && line.p2.y === nextLine.p1.y && line.isCommitted === nextLine.isCommitted) {
-				line.p2.y = nextLine.p2.y;
-				lines.splice(i + 1, 1);
-			} else {
-				i++;
-			}
-		}
+		const isAngular = config.style === GG.GraphStyle.Angular;
+		let svgPath: string = '';
+		let rowHeightOffset: number = config.grid.y * (isAngular ? 0.38 : 0.8);
 
-		// Iterate through all lines, producing and adding the svg paths to the DOM
-		for (i = 0; i < lines.length; i++) {
-			line = lines[i];
-			x1 = line.p1.x; y1 = line.p1.y;
-			x2 = line.p2.x; y2 = line.p2.y;
+		// This second passthrough generates the SVG "path"s, uhm, path code - but just the path, not the element
+		// When we're done with a path, we add it to the DOM
+		for (let i = 0; i < screenLines.length; i++) {
+			svgPath = '';
+			curLine = screenLines[i];
+			p1 = curLine.p1;
+			p2 = curLine.p2;
 
-			// If the new point belongs to a different path, render the current path and reset it for the new path
-			if (curPath !== '' && i > 0 && line.isCommitted !== lines[i - 1].isCommitted) {
-				Branch.drawPath(svg, curPath, lines[i - 1].isCommitted, colour, config.uncommittedChanges);
-				curPath = '';
-			}
-
-			// If the path hasn't been started or the new point belongs to a different path, move to p1
-			if (curPath === '' || (i > 0 && (x1 !== lines[i - 1].p2.x || y1 !== lines[i - 1].p2.y))) curPath += 'M' + x1.toFixed(0) + ',' + y1.toFixed(1);
-
-			if (x1 === x2) { // If the path is vertical, draw a straight line
-				curPath += 'L' + x2.toFixed(0) + ',' + y2.toFixed(1);
-			} else { // If the path moves horizontal, draw the appropriate transition
-				if (config.style === GG.GraphStyle.Angular) {
-					curPath += 'L' + (line.lockedFirst ? (x2.toFixed(0) + ',' + (y2 - d).toFixed(1)) : (x1.toFixed(0) + ',' + (y1 + d).toFixed(1))) + 'L' + x2.toFixed(0) + ',' + y2.toFixed(1);
-				} else {
-					curPath += 'C' + x1.toFixed(0) + ',' + (y1 + d).toFixed(1) + ' ' + x2.toFixed(0) + ',' + (y2 - d).toFixed(1) + ' ' + x2.toFixed(0) + ',' + y2.toFixed(1);
+			// Set SVG Path
+			svgPath += `M${p1.x.toFixed(0)},${p1.y.toFixed(1)} `; // Move to P1
+			if (curLine.curveTiming === CurveTiming.NoCurve) {
+				// No issue means no channel change, so draw a line straight down
+				svgPath += `L${p2.x.toFixed(0)},${p2.y.toFixed(1)} `;
+			} else if (curLine.curveTiming === CurveTiming.CurveFirst) {
+				// CurveFirst means draw a curve now
+				if (isAngular) svgPath += `L${p2.x.toFixed(0)},${(p1.y + rowHeightOffset).toFixed(1)} `;
+				else {
+					p3 = { x: p2.x, y: p1.y + config.grid.y };
+					svgPath += `C${p1.x.toFixed(0)},${(p1.y + rowHeightOffset).toFixed(1)} ${p3.x.toFixed(0)},${(p3.y - rowHeightOffset).toFixed(1)} ${p3.x.toFixed(0)},${(p3.y).toFixed(1)} `;
 				}
-			}
-		}
 
-		if (curPath !== '') {
-			Branch.drawPath(svg, curPath, lines[lines.length - 1].isCommitted, colour, config.uncommittedChanges); // Draw the remaining path
+				svgPath += `L${p2.x.toFixed(0)},${p2.y.toFixed(1)} `;
+			} else if (curLine.curveTiming === CurveTiming.CurveLast) {
+				// CurveLast means draw a curve later
+
+				p3 = { x: p1.x, y: p2.y - config.grid.y };
+				svgPath += `L${p3.x.toFixed(0)},${p3.y.toFixed(1)} `;
+
+				if (isAngular) svgPath += `L${p2.x.toFixed(0)},${(p2.y).toFixed(1)} `;
+				else svgPath += `C${p3.x.toFixed(0)},${(p3.y + rowHeightOffset).toFixed(1)} ${p2.x.toFixed(0)},${(p2.y - rowHeightOffset).toFixed(1)} ${p2.x.toFixed(0)},${p2.y.toFixed(1)} `;
+			}
+
+			const shadow = svg.appendChild(document.createElementNS(SVG_NAMESPACE, 'path'));
+			const line = svg.appendChild(document.createElementNS(SVG_NAMESPACE, 'path'));
+			shadow.setAttribute('class', 'shadow');
+			shadow.setAttribute('fill', 'transparent');
+			shadow.setAttribute('d', svgPath);
+			line.setAttribute('class', 'line');
+			line.setAttribute('d', svgPath);
+			line.setAttribute('stroke', curLine.isCommitted ? curLine.colour : DEFAULT_COLOUR);
+			if (!curLine.isCommitted && config.uncommittedChanges === GG.GraphUncommittedChangesStyle.OpenCircleAtTheCheckedOutCommit) {
+				line.setAttribute('stroke-dasharray', '2px');
+			}
 		}
 	}
 
-	private static drawPath(svg: SVGElement, path: string, isCommitted: boolean, colour: string, uncommittedChanges: GG.GraphUncommittedChangesStyle) {
-		const shadow = svg.appendChild(document.createElementNS(SVG_NAMESPACE, 'path')), line = svg.appendChild(document.createElementNS(SVG_NAMESPACE, 'path'));
-		shadow.setAttribute('class', 'shadow');
-		shadow.setAttribute('d', path);
-		line.setAttribute('class', 'line');
-		line.setAttribute('d', path);
-		line.setAttribute('stroke', isCommitted ? colour : '#808080');
-		if (!isCommitted && uncommittedChanges === GG.GraphUncommittedChangesStyle.OpenCircleAtTheCheckedOutCommit) {
-			line.setAttribute('stroke-dasharray', '2px');
+	public resetLines(): void {
+		this.lines = [];
+	}
+
+	public buildLines(config: GG.GraphConfig, commit: Commit2 = this.tip): void {
+		let parents = commit.getParents();
+		for (let parent of parents) {
+			this.lines.push({
+				p1: commit,
+				p2: parent,
+				curveTiming: commit.x === parent.x ? CurveTiming.NoCurve : commit.x < parent.x ? CurveTiming.CurveFirst : CurveTiming.CurveLast,
+				isCommitted: commit.isCommitted(),
+				colour: parent.x > commit.x ? parent.getColour(config) : commit.getColour(config)
+			});
+			if (parent.branch === this) this.buildLines(config, parent);
 		}
+	}
+
+	public getColour(config: GG.GraphConfig) {
+		return Branch2.getBranchColor(this, config);
+	}
+
+	public collapseLeft(graph: Graph) {
+		if (this.isPriority) return;
+
+		const getYoungestChild = (commit: Commit2) => {
+			if (commit.getChildren().length === 0) return null;
+			return commit.getChildren().reduce((found, current) => ((found?.y ?? Infinity) > current.y ? current : found));
+		};
+
+		let commit: Commit2;
+		let commitQueue: Commit2[] = [this.tip];
+		let youngest: Commit2 | null;
+		let commitsBetween: ReadonlyArray<Commit2>;
+
+		let avilableChannels: number[] = graph.getAvailableChannels().slice();
+		let keepRunning = true; // we want to run up to one commit past this branch, so we'll keep track of when to stop
+
+		while (commitQueue.length > 0) {
+			commit = commitQueue.shift()!;
+			if (commit.branch !== this) keepRunning = false;
+
+			youngest = getYoungestChild(commit);
+			commitsBetween = graph.getCommitsBetween(youngest, commit);
+			for (let cb of commitsBetween) {
+				if (cb.branch === this) continue; // skip commits on this branch
+
+				let cbi = avilableChannels.indexOf(cb.x);
+				if (cbi !== -1) avilableChannels.splice(cbi, 1);
+			}
+
+			if (keepRunning) commitQueue.push(...commit.getParents());
+		}
+
+		if (avilableChannels.length > 0) {
+			// We have an x we can use, so update!
+			this.x = Math.min(this.x, ...avilableChannels);
+		}
+	}
+
+	public static getBranchColor(branch: Branch2, config: GG.GraphConfig) {
+		return config.colours[branch.x % config.colours.length];
 	}
 }
 
 
-/* Vertex Class */
+/* Commit Class */
+class Commit2 {
+	public readonly y: number;
+	public readonly commit: GG.GitCommit;
+	public readonly definedHeads: Set<Branch2>;
+	public readonly inferredHeads: Set<Branch2> = new Set<Branch2>([]);
 
-class Vertex {
-	public readonly id: number;
-	public readonly isStash: boolean;
+	private _branch: Branch2 | null;
+	private _childrenCommits: Commit2[] = [];
+	private _parentCommits: Commit2[] = [];
+	private _isDroppable: boolean = false;
 
-	private x: number = 0;
-	private children: Vertex[] = [];
-	private parents: Vertex[] = [];
-	private nextParent: number = 0;
-	private onBranch: Branch | null = null;
-	private isCommitted: boolean = true;
-	private isCurrent: boolean = false;
-	private nextX: number = 0;
-	private connections: UnavailablePoint[] = [];
+	private _allHeads: Set<Branch2> | null = null;
+	public isCurrent: boolean = false;
 
-	constructor(id: number, isStash: boolean) {
-		this.id = id;
-		this.isStash = isStash;
+	constructor(y: number, commit: GG.GitCommit) {
+		this.y = y;
+		this.commit = commit;
+		this.definedHeads = new Set<Branch2>([]);
+		this._branch = null;
+
+		if (commit.heads.length > 0) this.definedHeads.add(new Branch2(-1, commit.heads[0], this));
+		else if (commit.remotes.length > 0) this.definedHeads.add(new Branch2(-1, commit.remotes[0].name, this));
 	}
 
-
-	/* Children */
-
-	public addChild(vertex: Vertex) {
-		this.children.push(vertex);
+	get id() {
+		// this ID is the same as the "y" value
+		// 'y' is generated from the commit's position in
+		// commit history which is what the ID refers to
+		return this.y;
+	}
+	get hash() {
+		return this.commit.hash;
+	}
+	get parents() {
+		return this.commit.parents;
+	}
+	get author() {
+		return this.commit.author;
+	}
+	get email() {
+		return this.commit.email;
+	}
+	get date() {
+		return this.commit.date;
+	}
+	get message() {
+		return this.commit.message;
+	}
+	get heads() {
+		return this.commit.heads;
+	}
+	get tags() {
+		return this.commit.tags;
+	}
+	get remotes() {
+		return this.commit.remotes;
+	}
+	get stash() {
+		return this.commit.stash;
 	}
 
-	public getChildren(): ReadonlyArray<Vertex> {
-		return this.children;
+	get shortHash() {
+		return abbrevCommit(this.hash);
 	}
 
-
-	/* Parents */
-
-	public addParent(vertex: Vertex) {
-		this.parents.push(vertex);
+	get children() {
+		return this._childrenCommits.map(c => c.hash);
 	}
 
-	public getParents(): ReadonlyArray<Vertex> {
-		return this.parents;
+	public getChildren() {
+		return this._childrenCommits;
+	}
+	public getParents() {
+		return this._parentCommits;
+	}
+	public getPoint() {
+		return { x: this.x, y: this.y } as Point;
 	}
 
+	get branch() {
+		return this._branch;
+	}
+
+	get allHeads(): Set<Branch2> {
+		if (!this._allHeads) this._allHeads = new Set([...Array.from(this.definedHeads), ...Array.from(this.inferredHeads)]);
+		return this._allHeads;
+	}
+
+	get x() {
+		return this._branch?.x ?? -1;
+	}
+
+	get isStashed() {
+		return this.stash !== null;
+	}
+
+	public getColour(config: GG.GraphConfig) {
+		if (!this.isCommitted()) return DEFAULT_COLOUR;
+		return this._branch?.getColour(config) ?? DEFAULT_COLOUR;
+	}
+
+	public isCommitted() {
+		return this.hash !== UNCOMMITTED;
+	}
+
+	public addParent(parent: Commit2) {
+		this._parentCommits.push(parent);
+		parent._childrenCommits.push(this);
+	}
 	public hasParents() {
 		return this.parents.length > 0;
 	}
-
-	public getNextParent(): Vertex | null {
-		if (this.nextParent < this.parents.length) return this.parents[this.nextParent];
-		return null;
-	}
-
-	public getLastParent(): Vertex | null {
-		if (this.nextParent < 1) return null;
-		return this.parents[this.nextParent - 1];
-	}
-
-	public registerParentProcessed() {
-		this.nextParent++;
-	}
-
 	public isMerge() {
-		return this.parents.length > 1;
+		return this.parents.length >= 2;
 	}
 
+	get isDroppable() {
+		return this._isDroppable;
+	}
+	public setDroppable() {
+		this._isDroppable = true;
+	}
 
-	/* Branch */
+	public hasHeads() {
+		return this.definedHeads.size > 0;
+	}
+	public hasInferredHeads() {
+		return this.inferredHeads.size > 0;
+	}
 
-	public addToBranch(branch: Branch, x: number) {
-		if (this.onBranch === null) {
-			this.onBranch = branch;
-			this.x = x;
+	public addHeads(heads: Set<Branch2>) {
+		if (heads.size > 0) {
+			heads.forEach(head => this.inferredHeads.add(head));
+			this._allHeads = null;
 		}
 	}
 
-	public isNotOnBranch() {
-		return this.onBranch === null;
+	public setBranchAccordingToPriority(priorities: readonly string[]) {
+		// Set this.branch to it's head/inferred according to the following algorithm:
+		// 1. If the commit has heads:
+		//    1. If there is only one head, set it as the branch.
+		//    2. If there are multiple heads, set the branch to the one with the best priority.
+		// 2. Otherwise, if the commit has inferred heads (all commits will have one or the other):
+		//    1. If the inferred heads contain priority heads, set the branch to the first priority head
+		//    2. Otherwise, set the branch to the first inferred head
+		let priorityHeads: Branch2[] = [];
+		let headsToUse: Branch2[];
+
+		if (this.hasHeads()) headsToUse = Array.from(this.definedHeads);
+		else headsToUse = Array.from(this.inferredHeads);
+
+		priorityHeads = headsToUse.filter(head => priorities.includes(head.name));
+		if (priorityHeads.length > 0) this._branch = priorityHeads[0];
+		else this._branch = headsToUse[0];
 	}
 
-	public isOnThisBranch(branch: Branch) {
-		return this.onBranch === branch;
-	}
+	public draw(svg: SVGElement, config: GG.GraphConfig, expandOffsetNeeded: boolean, overListener: (event: MouseEvent) => void, outListener: (event: MouseEvent) => void) {
+		if (this._branch === null) return;
 
-	public getBranch() {
-		return this.onBranch;
-	}
-
-
-	/* Point */
-
-	public getPoint(): Point {
-		return { x: this.x, y: this.id };
-	}
-
-	public getNextPoint(): Point {
-		return { x: this.nextX, y: this.id };
-	}
-
-	public getPointConnectingTo(vertex: VertexOrNull, onBranch: Branch) {
-		for (let i = 0; i < this.connections.length; i++) {
-			if (this.connections[i].connectsTo === vertex && this.connections[i].onBranch === onBranch) {
-				return { x: i, y: this.id };
-			}
-		}
-		return null;
-	}
-	public registerUnavailablePoint(x: number, connectsToVertex: VertexOrNull, onBranch: Branch) {
-		if (x === this.nextX) {
-			this.nextX = x + 1;
-			this.connections[x] = { connectsTo: connectsToVertex, onBranch: onBranch };
-		}
-	}
-
-
-	/* Get / Set State */
-
-	public getColour() {
-		return this.onBranch !== null ? this.onBranch.getColour() : 0;
-	}
-
-	public getIsCommitted() {
-		return this.isCommitted;
-	}
-
-	public setNotCommitted() {
-		this.isCommitted = false;
-	}
-
-	public setCurrent() {
-		this.isCurrent = true;
-	}
-
-
-	/* Rendering */
-
-	public draw(svg: SVGElement, config: GG.GraphConfig, expandOffset: boolean, overListener: (event: MouseEvent) => void, outListener: (event: MouseEvent) => void) {
-		if (this.onBranch === null) return;
-
-		const colour = this.isCommitted ? config.colours[this.onBranch.getColour() % config.colours.length] : '#808080';
+		const colour = this.getColour(config);
 		const cx = (this.x * config.grid.x + config.grid.offsetX).toString();
-		const cy = (this.id * config.grid.y + config.grid.offsetY + (expandOffset ? config.grid.expandY : 0)).toString();
+		const cy = (this.y * config.grid.y + config.grid.offsetY + (expandOffsetNeeded ? config.grid.expandY : 0)).toString();
 
 		const circle = document.createElementNS(SVG_NAMESPACE, 'circle');
 		circle.dataset.id = this.id.toString();
 		circle.setAttribute('cx', cx);
 		circle.setAttribute('cy', cy);
 		circle.setAttribute('r', '4');
+		circle.dataset.coord = `(${this.x}, ${this.y})`;
 		if (this.isCurrent) {
 			circle.setAttribute('class', 'current');
 			circle.setAttribute('stroke', colour);
 		} else {
 			circle.setAttribute('fill', colour);
 		}
+
 		svg.appendChild(circle);
 
-		if (this.isStash && !this.isCurrent) {
+		if (this.isStashed && !this.isCurrent) {
 			circle.setAttribute('r', '4.5');
 			circle.setAttribute('class', 'stashOuter');
 			const innerCircle = document.createElementNS(SVG_NAMESPACE, 'circle');
@@ -329,6 +432,10 @@ class Vertex {
 		circle.addEventListener('mouseover', overListener);
 		circle.addEventListener('mouseout', outListener);
 	}
+
+	public toJSON() {
+		return this.commit;
+	}
 }
 
 
@@ -337,12 +444,11 @@ class Vertex {
 class Graph {
 	private readonly config: GG.GraphConfig;
 	private readonly muteConfig: GG.MuteCommitsConfig;
-	private vertices: Vertex[] = [];
-	private branches: Branch[] = [];
-	private availableColours: number[] = [];
+	private branches: Branch2[] = [];
 	private maxWidth: number = -1;
+	private availableChannelsCache: ReadonlyArray<number> | null = null;
 
-	private commits: ReadonlyArray<GG.GitCommit> = [];
+	private commits: ReadonlyArray<Commit2> = [];
 	private commitHead: string | null = null;
 	private commitLookup: { [hash: string]: number } = {};
 	private onlyFollowFirstParent: boolean = false;
@@ -359,7 +465,7 @@ class Graph {
 	private tooltipId: number = -1;
 	private tooltipElem: HTMLElement | null = null;
 	private tooltipTimeout: NodeJS.Timer | null = null;
-	private tooltipVertex: HTMLElement | null = null;
+	private tooltipCommit: HTMLElement | null = null;
 
 	constructor(id: string, viewElem: HTMLElement, config: GG.GraphConfig, muteConfig: GG.MuteCommitsConfig) {
 		this.viewElem = viewElem;
@@ -389,69 +495,129 @@ class Graph {
 
 
 	/* Graph Operations */
-
-	public loadCommits(commits: ReadonlyArray<GG.GitCommit>, commitHead: string | null, commitLookup: { [hash: string]: number }, onlyFollowFirstParent: boolean) {
+	public loadCommits(commits: ReadonlyArray<Commit2>, commitHead: string | null, commitLookup: { [hash: string]: number }, onlyFollowFirstParent: boolean, priorityBranches: ReadonlyArray<string>) {
 		this.commits = commits;
 		this.commitHead = commitHead;
 		this.commitLookup = commitLookup;
 		this.onlyFollowFirstParent = onlyFollowFirstParent;
-		this.vertices = [];
 		this.branches = [];
-		this.availableColours = [];
+		this.availableChannelsCache = null;
 		if (commits.length === 0) return;
 
-		const nullVertex = new Vertex(NULL_VERTEX_ID, false);
-		let i: number, j: number;
-		for (i = 0; i < commits.length; i++) {
-			this.vertices.push(new Vertex(i, commits[i].stash !== null));
-		}
-		for (i = 0; i < commits.length; i++) {
-			for (j = 0; j < commits[i].parents.length; j++) {
-				let parentHash = commits[i].parents[j];
-				if (typeof commitLookup[parentHash] === 'number') {
-					// Parent is the <commitLookup[parentHash]>th vertex
-					this.vertices[i].addParent(this.vertices[commitLookup[parentHash]]);
-					this.vertices[commitLookup[parentHash]].addChild(this.vertices[i]);
-				} else if (!this.onlyFollowFirstParent || j === 0) {
-					// Parent is not one of the vertices of the graph, and the parent isn't being hidden by the onlyFollowFirstParent condition.
-					this.vertices[i].addParent(nullVertex);
-				}
-			}
-		}
-
-		if (commits[0].hash === UNCOMMITTED) {
-			this.vertices[0].setNotCommitted();
-		}
-
-		if (commits[0].hash === UNCOMMITTED && this.config.uncommittedChanges === GG.GraphUncommittedChangesStyle.OpenCircleAtTheUncommittedChanges) {
-			this.vertices[0].setCurrent();
+		if (!this.commits[0].isCommitted() && this.config.uncommittedChanges === GG.GraphUncommittedChangesStyle.OpenCircleAtTheUncommittedChanges) {
+			this.commits[0].isCurrent = true;
 		} else if (commitHead !== null && typeof commitLookup[commitHead] === 'number') {
-			this.vertices[commitLookup[commitHead]].setCurrent();
+			this.getCommitFromHash(commitHead)!.isCurrent = true;
 		}
 
-		i = 0;
-		while (i < this.vertices.length) {
-			if (this.vertices[i].getNextParent() !== null || this.vertices[i].isNotOnBranch()) {
-				this.determinePath(i);
-			} else {
-				i++;
+		// The first passthrough is to link parents and children, and share heads (aka Branch2) to ancestors.
+		// We also set droppable branches here.
+		let dropping = true;
+		let headProcessed = false;
+		commits.forEach((commitObj) => {
+			commitObj.definedHeads.forEach((b) => {
+				if (!this.branches.includes(b)) {
+					let bb = this.branches.findIndex(bb => bb.branchName === b.branchName);
+					if (bb !== -1 && this.branches[bb].isDirectAncestor(b)) b.branchToFollow = this.branches[bb];
+					this.branches.push(b);
+				}
+			});
+
+			commitObj.parents.forEach((parent, i) => {
+				if (this.onlyFollowFirstParent && i !== 0) return;
+
+				let parentObj = this.getCommitFromHash(parent);
+				if (parentObj === undefined) return;
+
+				commitObj.addParent(parentObj);
+
+				// heads are sets, so if we happen to add two "main"s, we don't get dupes
+				if (!parentObj.hasHeads() && i === 0) {
+					parentObj.addHeads(commitObj.definedHeads);
+					parentObj.addHeads(commitObj.inferredHeads);
+				}
+			});
+
+			// By default, all commits are non-droppable, and must satisfy a condition to become droppable
+			if (dropping) {
+				if (commitObj.isMerge()) dropping = false;
+				else if (commitObj.hash === this.commitHead || headProcessed) {
+					commitObj.setDroppable();
+					headProcessed = true;
+				} // TODO: are there any other conditions making commits droppable/not?
 			}
+		});
+
+		// If we have an uncommitted, then share its heads from its parent, and reset the tip
+		if (!this.commits[0].isCommitted()) {
+			this.commits[0].addHeads(this.commits[0].getParents()[0].definedHeads);
+			this.commits[0].addHeads(this.commits[0].getParents()[0].inferredHeads);
+			Array.from(this.commits[0].getParents()[0].definedHeads)[0].tip = this.commits[0];
+		}
+
+		// The second passthrough is what actually creates the priorities for the branches
+		// This might be able to be condensed into the first passthrough!
+		// Changing priorities allows us to assign "channels" to non-prioritised branches
+		// We also identify any deleted branches through the "untrackedHeads" variable.
+		let changingPriorities = priorityBranches.slice();
+		let untrackedHeads: Branch2[] = [];
+		let priorityBranchObjects: Branch2[] = [];
+		// for (let c = 0; c < this.commits.length; c++) {
+		for (let commitObj of this.commits) {
+			// We loop through commits to do this, because we need to loop through commits anyway
+			// let commitObj = this.commits[c];
+
+			// If we have our own head
+			if (commitObj.hasHeads()) {
+				commitObj.definedHeads.forEach((head) => {
+					head.setPriority(changingPriorities);
+					if (head.x === -1) {
+						head.x = changingPriorities.length;
+						changingPriorities.push(head.name);
+					} else priorityBranchObjects.push(head);
+				});
+			} else if (!commitObj.hasInferredHeads()) { // no defined heads and no inferred heads
+				let untrackedBranch = new Branch2(untrackedHeads.length, '', commitObj);
+				let untrackedBranchAsSet = new Set<Branch2>([untrackedBranch]);
+				const recurse = (commit: Commit2) => {
+					if (commit.hasHeads() || commit.hasInferredHeads()) return;
+					commit.addHeads(untrackedBranchAsSet);
+					commit.getParents().forEach(recurse);
+				};
+				recurse(commitObj);
+				untrackedHeads.push(untrackedBranch);
+				this.branches.push(untrackedBranch);
+			}
+
+			// This will set the commit's branch to the highest priority
+			// If it doesn't have a priority branch, then the next "best" branch is used
+			// ("best" bc lack of a better word...)
+			commitObj.setBranchAccordingToPriority(priorityBranches);
+		}
+		untrackedHeads.forEach((h) => h.x += changingPriorities.length);
+
+		// This last passthrough ensures that there are no gaps between the branches (all channels used)
+		let sortedBranches = this.branches.sort((a, b) => a.x - b.x);
+		let offset = 0;
+		for (let x = 0; x < sortedBranches.length; x++) {
+			if (sortedBranches[x].branchToFollow !== null) offset++;
+			sortedBranches[x].x = x - offset;
 		}
 	}
 
 	public render(expandedCommit: ExpandedCommit | null) {
 		this.expandedCommitIndex = expandedCommit !== null ? expandedCommit.index : -1;
-		let group = document.createElementNS(SVG_NAMESPACE, 'g'), i, contentWidth = this.getContentWidth();
+		let group = document.createElementNS(SVG_NAMESPACE, 'g');
+		let contentWidth = this.getContentWidth();
 		group.setAttribute('mask', 'url(#GraphMask)');
 
-		for (i = 0; i < this.branches.length; i++) {
-			this.branches[i].draw(group, this.config, this.expandedCommitIndex);
-		}
+		// We need to collapse everything left before we can render everything!
+		this.branches.forEach(b => b.collapseLeft(this));
+		this.branches.forEach(b => b.draw(group, this.config, this.expandedCommitIndex));
 
-		const overListener = (e: MouseEvent) => this.vertexOver(e), outListener = (e: MouseEvent) => this.vertexOut(e);
-		for (i = 0; i < this.vertices.length; i++) {
-			this.vertices[i].draw(group, this.config, expandedCommit !== null && i > expandedCommit.index, overListener, outListener);
-		}
+		const overListener = (e: MouseEvent) => this.commitPointHoverStart(e);
+		const outListener = (e: MouseEvent) => this.commitPointHoverEnd(e);
+		this.commits.forEach((c, i) => c.draw(group, this.config, expandedCommit !== null && i > expandedCommit.index, overListener, outListener));
 
 		if (this.group !== null) this.svg.removeChild(this.group);
 		this.svg.appendChild(group);
@@ -464,31 +630,29 @@ class Graph {
 
 	/* Get */
 
+	public getCommitFromHash(hash: string): Commit2 | undefined {
+		return this.commits[this.commitLookup[hash]];
+	}
+
 	public getContentWidth() {
-		let x = 0, i, p;
-		for (i = 0; i < this.vertices.length; i++) {
-			p = this.vertices[i].getNextPoint();
-			if (p.x > x) x = p.x;
+		let x = 0;
+		let bx;
+		for (let i = 0; i < this.commits.length; i++) {
+			bx = this.commits[i].branch?.x ?? 0;
+			if (bx > x) x = bx;
 		}
-		return 2 * this.config.grid.offsetX + (x - 1) * this.config.grid.x;
+		return 2 * this.config.grid.offsetX + x * this.config.grid.x;
 	}
 
 	public getHeight(expandedCommit: ExpandedCommit | null) {
-		return this.vertices.length * this.config.grid.y + this.config.grid.offsetY - this.config.grid.y / 2 + (expandedCommit !== null ? this.config.grid.expandY : 0);
-	}
-
-	public getVertexColours() {
-		let colours = [], i;
-		for (i = 0; i < this.vertices.length; i++) {
-			colours[i] = this.vertices[i].getColour() % this.config.colours.length;
-		}
-		return colours;
+		return this.commits.length * this.config.grid.y + this.config.grid.offsetY - this.config.grid.y / 2 + (expandedCommit !== null ? this.config.grid.expandY : 0);
 	}
 
 	public getWidthsAtVertices() {
-		let widths = [], i;
-		for (i = 0; i < this.vertices.length; i++) {
-			widths[i] = this.config.grid.offsetX + this.vertices[i].getNextPoint().x * this.config.grid.x - 2;
+		let widths = [];
+		for (let i = 0; i < this.commits.length; i++) {
+			// 										Plus 1 because otherwise the first column has no width
+			widths[i] = this.config.grid.offsetX + (this.commits[i].x + 1) * this.config.grid.x - 2;
 		}
 		return widths;
 	}
@@ -501,92 +665,99 @@ class Graph {
 	 * @param i Index of the commit to test.
 	 * @returns TRUE => Commit can be dropped, FALSE => Commit can't be dropped
 	 */
-	public dropCommitPossible(i: number) {
-		if (!this.vertices[i].hasParents()) {
-			return false; // No parents
+	public dropCommitPossible(i: number | string) {
+		if (typeof i === 'number') {
+			return this.commits[i].isDroppable;
+		} else if (typeof i === 'string') {
+			return this.getCommitFromHash(i)?.isDroppable ?? false;
 		}
 
-		const isPossible = (v: Vertex): boolean | null => {
-			if (v.isMerge()) {
-				// Commit is a merge - fails topological test
-				return null;
-			}
-
-			let children = v.getChildren();
-			if (children.length > 1) {
-				// Commit has multiple children - fails topological test
-				return null;
-			} else if (children.length === 1) {
-				const recursivelyPossible = isPossible(children[0]);
-				if (recursivelyPossible !== false) {
-					// Topological tests failed (recursivelyPossible === NULL), or the HEAD has already been found (recursivelyPossible === TRUE)
-					return recursivelyPossible;
-				}
-			}
-
-			// Check if the current vertex is the HEAD if it has no children, or the HEAD has not been found in its recursive children.
-			return this.commits[v.id].hash === this.commitHead;
-		};
-
-		return isPossible(this.vertices[i]) || false;
+		return false;
 	}
 
 	private getAllChildren(i: number) {
-		let visited: { [id: string]: number } = {};
-		const rec = (vertex: Vertex) => {
-			const idStr = vertex.id.toString();
-			if (typeof visited[idStr] !== 'undefined') return;
+		let visited: Set<Commit2> = new Set<Commit2>();
+		const recurse = (commit: Commit2) => {
+			if (visited.has(commit)) return;
 
-			visited[idStr] = vertex.id;
-			let children = vertex.getChildren();
-			for (let i = 0; i < children.length; i++) rec(children[i]);
+			visited.add(commit);
+			let children = commit.getChildren();
+			children.forEach(recurse);
 		};
-		rec(this.vertices[i]);
-		return Object.keys(visited).map((key) => visited[key]).sort((a, b) => a - b);
+		recurse(this.commits[i]);
+		return Array.from(visited).sort((a, b) => a.id - b.id);
 	}
 
 	public getMutedCommits(currentHash: string | null) {
-		const muted = [];
+		const muted = new Array(this.commits.length).fill(false);
+		let shownAncestors: string[] | null = null;
+		if (currentHash !== null && typeof this.commitLookup[currentHash] === 'number') shownAncestors = [currentHash];
+
+		let commit: Commit2;
 		for (let i = 0; i < this.commits.length; i++) {
 			muted[i] = false;
-		}
+			commit = this.commits[i];
 
-		// Mute any merge commits if the Extension Setting is enabled
-		if (this.muteConfig.mergeCommits) {
-			for (let i = 0; i < this.commits.length; i++) {
-				if (this.vertices[i].isMerge() && this.commits[i].stash === null) {
-					// The commit is a merge, and is not a stash
-					muted[i] = true;
-				}
-			}
-		}
-
-		// Mute any commits that are not ancestors of the commit head if the Extension Setting is enabled, and the head commit is in the graph
-		if (this.muteConfig.commitsNotAncestorsOfHead && currentHash !== null && typeof this.commitLookup[currentHash] === 'number') {
-			let ancestor: boolean[] = [];
-			for (let i = 0; i < this.commits.length; i++) {
-				ancestor[i] = false;
+			// Mute any merge commits if the Extension Setting is enabled
+			if (this.muteConfig.mergeCommits) {
+				if (commit.isMerge() && !commit.isStashed) muted[i] = true;
 			}
 
-			// Recursively discover ancestors of commit head
-			const rec = (vertex: Vertex) => {
-				if (vertex.id === NULL_VERTEX_ID || ancestor[vertex.id]) return;
-				ancestor[vertex.id] = true;
+			// Mute commits that are not ancestors of the commit head if the Extension Setting is enabled, and the head commit is in the graph
+			// If Non-Ancestors should be muted && we have a shownAncestors array (we have a current hash AND it's in the graph)
+			if (this.muteConfig.commitsNotAncestorsOfHead && shownAncestors !== null) {
+				muted[i] = true;
 
-				let parents = vertex.getParents();
-				for (let i = 0; i < parents.length; i++) rec(parents[i]);
-			};
-			rec(this.vertices[this.commitLookup[currentHash]]);
-
-			for (let i = 0; i < this.commits.length; i++) {
-				if (!ancestor[i] && (this.commits[i].stash === null || typeof this.commitLookup[this.commits[i].stash!.baseHash] !== 'number' || !ancestor[this.commitLookup[this.commits[i].stash!.baseHash]])) {
-					// Commit i is not an ancestor of currentHash, or a stash based on an ancestor of currentHash
-					muted[i] = true;
+				let ancestorIndex = shownAncestors.indexOf(commit.hash);
+				let isStashOfAncestor = commit.isStashed && typeof this.commitLookup[commit.hash] === 'number' && shownAncestors.includes(commit.stash!.baseHash); // this has no performance effect
+				if (ancestorIndex !== -1 || isStashOfAncestor) {
+					// Unmute this commit
+					muted[i] = false;
+					// Remove this ancestor to keep the array slim
+					shownAncestors.splice(ancestorIndex, 1);
+					// Push parent hashes
+					shownAncestors.push(...commit.parents);
 				}
 			}
 		}
 
 		return muted;
+	}
+
+	public getCommitsBetween(start: Commit2 | null | number = 0, end: Commit2 | null | number = -1): ReadonlyArray<Commit2> {
+		if (start === null) start = 0;
+		if (start instanceof Commit2) start = start.y;
+		if (end === null) end = 0;
+		if (end instanceof Commit2) end = end.y;
+
+		start = Math.max(start, 0);
+		if (end === -1) end = this.commits.length;
+		end = Math.min(this.commits.length, end);
+		if (start >= end) return [];
+
+		return this.commits.slice(start, end);
+	}
+
+	public getPriorityChannels(): number[] {
+		const channels = [];
+		for (let b of this.branches) {
+			if (b.isPriority) channels.push(b.x);
+			else break; // we've passed all priorities
+		}
+		return channels;
+	}
+	public getAvailableChannels(useCache: boolean = true): ReadonlyArray<number> {
+		if (useCache && this.availableChannelsCache !== null) return this.availableChannelsCache;
+		const channels = [];
+		for (let b = 0; b < this.branches.length; b++) {
+			if (!this.branches[b].isPriority) channels.push(b);
+		}
+		this.availableChannelsCache = channels.slice();
+		return this.availableChannelsCache;
+	}
+
+	public getBranchCount(): number {
+		return this.branches.length;
 	}
 
 
@@ -596,10 +767,8 @@ class Graph {
 	 * @returns The index of the first parent, or -1 if there is no parent.
 	 */
 	public getFirstParentIndex(i: number) {
-		const parents = this.vertices[i].getParents();
-		return parents.length > 0
-			? parents[0].id
-			: -1;
+		const parents = this.commits[i].getParents();
+		return parents[0]?.id ?? -1;
 	}
 
 	/**
@@ -608,12 +777,8 @@ class Graph {
 	 * @returns The index of the alternative parent, or -1 if there is no parent.
 	 */
 	public getAlternativeParentIndex(i: number) {
-		const parents = this.vertices[i].getParents();
-		return parents.length > 1
-			? parents[1].id
-			: parents.length === 1
-				? parents[0].id
-				: -1;
+		const parents = this.commits[i].getParents();
+		return parents[1]?.id ?? parents[0]?.id ?? -1;
 	}
 
 	/**
@@ -622,16 +787,17 @@ class Graph {
 	 * @returns The index of the first child, or -1 if there is no child.
 	 */
 	public getFirstChildIndex(i: number) {
-		const children = this.vertices[i].getChildren();
+		const children = this.commits[i].getChildren();
 		if (children.length > 1) {
 			// The vertex has multiple children
-			const branch = this.vertices[i].getBranch();
-			let childOnSameBranch: Vertex | undefined;
-			if (branch !== null && (childOnSameBranch = children.find((child) => child.isOnThisBranch(branch)))) {
+			const branch = this.commits[i].branch;
+			let childOnSameBranch: Commit2 | undefined;
+			if (branch !== null && !!(childOnSameBranch = children.find((child) => child.branch === branch))) {
 				// If a child could be found on the same branch as the vertex
 				return childOnSameBranch.id;
 			} else {
 				// No child could be found on the same branch as the vertex
+				// return the largest ID because that's the closest commit
 				return Math.max(...children.map((child) => child.id));
 			}
 		} else if (children.length === 1) {
@@ -649,18 +815,18 @@ class Graph {
 	 * @returns The index of the alternative child, or -1 if there is no child.
 	 */
 	public getAlternativeChildIndex(i: number) {
-		const children = this.vertices[i].getChildren();
+		const children = this.commits[i].getChildren();
 		if (children.length > 1) {
 			// The vertex has multiple children
-			const branch = this.vertices[i].getBranch();
-			let childOnSameBranch: Vertex | undefined;
-			if (branch !== null && (childOnSameBranch = children.find((child) => child.isOnThisBranch(branch)))) {
-				// If a child could be found on the same branch as the vertex
-				return Math.max(...children.filter(child => child !== childOnSameBranch).map((child) => child.id));
+			const branch = this.commits[i].branch;
+			let childrenOnSameBranch: Commit2[] | undefined;
+			if (branch !== null && (childrenOnSameBranch = children.filter((child) => child.branch === branch)).length > 0) {
+				// If a child could be found on the same branch as the commit
+				return Math.max(...childrenOnSameBranch.map((child) => child.id));
 			} else {
 				// No child could be found on the same branch as the vertex
-				const childIndexes = children.map((child) => child.id).sort();
-				return childIndexes[childIndexes.length - 2];
+				const childIndexes = children.map((child) => child.id).sort(); // closest child is highest index
+				return childIndexes[childIndexes.length - 2]; // get second last bc last is returned from getFirstChildIndex
 			}
 		} else if (children.length === 1) {
 			// The vertex has a single child
@@ -700,87 +866,15 @@ class Graph {
 	}
 
 
-	/* Graph Layout Methods */
-
-	private determinePath(startAt: number) {
-		let i = startAt;
-		let vertex = this.vertices[i], parentVertex = this.vertices[i].getNextParent(), curVertex;
-		let lastPoint = vertex.isNotOnBranch() ? vertex.getNextPoint() : vertex.getPoint(), curPoint;
-
-		if (parentVertex !== null && parentVertex.id !== NULL_VERTEX_ID && vertex.isMerge() && !vertex.isNotOnBranch() && !parentVertex.isNotOnBranch()) {
-			// Branch is a merge between two vertices already on branches
-			let foundPointToParent = false, parentBranch = parentVertex.getBranch()!;
-			for (i = startAt + 1; i < this.vertices.length; i++) {
-				curVertex = this.vertices[i];
-				curPoint = curVertex.getPointConnectingTo(parentVertex, parentBranch); // Check if there is already a point connecting the ith vertex to the required parent
-				if (curPoint !== null) {
-					foundPointToParent = true; // Parent was found
-				} else {
-					curPoint = curVertex.getNextPoint(); // Parent couldn't be found, choose the next available point for the vertex
-				}
-				parentBranch.addLine(lastPoint, curPoint, vertex.getIsCommitted(), !foundPointToParent && curVertex !== parentVertex ? lastPoint.x < curPoint.x : true);
-				curVertex.registerUnavailablePoint(curPoint.x, parentVertex, parentBranch);
-				lastPoint = curPoint;
-
-				if (foundPointToParent) {
-					vertex.registerParentProcessed();
-					break;
-				}
-			}
-		} else {
-			// Branch is normal
-			let branch = new Branch(this.getAvailableColour(startAt));
-			vertex.addToBranch(branch, lastPoint.x);
-			vertex.registerUnavailablePoint(lastPoint.x, vertex, branch);
-			for (i = startAt + 1; i < this.vertices.length; i++) {
-				curVertex = this.vertices[i];
-				curPoint = parentVertex === curVertex && !parentVertex.isNotOnBranch() ? curVertex.getPoint() : curVertex.getNextPoint();
-				branch.addLine(lastPoint, curPoint, vertex.getIsCommitted(), lastPoint.x < curPoint.x);
-				curVertex.registerUnavailablePoint(curPoint.x, parentVertex, branch);
-				lastPoint = curPoint;
-
-				if (parentVertex === curVertex) {
-					// The parent of <vertex> has been reached, progress <vertex> and <parentVertex> to continue building the branch
-					vertex.registerParentProcessed();
-					let parentVertexOnBranch = !parentVertex.isNotOnBranch();
-					parentVertex.addToBranch(branch, curPoint.x);
-					vertex = parentVertex;
-					parentVertex = vertex.getNextParent();
-					if (parentVertex === null || parentVertexOnBranch) {
-						// There are no more parent vertices, or the parent was already on a branch
-						break;
-					}
-				}
-			}
-			if (i === this.vertices.length && parentVertex !== null && parentVertex.id === NULL_VERTEX_ID) {
-				// Vertex is the last in the graph, so no more branch can be formed to the parent
-				vertex.registerParentProcessed();
-			}
-			branch.setEnd(i);
-			this.branches.push(branch);
-			this.availableColours[branch.getColour()] = i;
-		}
-	}
-
-	private getAvailableColour(startAt: number) {
-		for (let i = 0; i < this.availableColours.length; i++) {
-			if (startAt > this.availableColours[i]) {
-				return i;
-			}
-		}
-		this.availableColours.push(0);
-		return this.availableColours.length - 1;
-	}
-
 
 	/* Vertex Info */
 
-	private vertexOver(event: MouseEvent) {
+	private commitPointHoverStart(event: MouseEvent) {
 		if (event.target === null) return;
 		this.closeTooltip();
 
-		const vertexElem = <HTMLElement>event.target;
-		const id = parseInt(vertexElem.dataset.id!);
+		const commitPoint = <HTMLElement>event.target;
+		const id = parseInt(commitPoint.dataset.id!);
 		this.tooltipId = id;
 		const commitElem = findCommitElemWithId(getCommitElems(), id);
 		if (commitElem !== null) commitElem.classList.add(CLASS_GRAPH_VERTEX_ACTIVE);
@@ -788,36 +882,38 @@ class Graph {
 		if (id < this.commits.length && this.commits[id].hash !== UNCOMMITTED) { // Only show tooltip for commits (not the uncommitted changes)
 			this.tooltipTimeout = setTimeout(() => {
 				this.tooltipTimeout = null;
-				let vertexScreenY = vertexElem.getBoundingClientRect().top + 4; // Get center of the circle
-				if (vertexScreenY >= 5 && vertexScreenY <= this.viewElem.clientHeight - 5) {
+				let commitPointScreenY = commitPoint.getBoundingClientRect().top + 4; // Get center of the circle
+				if (commitPointScreenY >= 5 && commitPointScreenY <= this.viewElem.clientHeight - 5) {
 					// Vertex is completely visible on the screen (not partially off)
-					this.tooltipVertex = vertexElem;
+					this.tooltipCommit = commitPoint;
 					closeDialogAndContextMenu();
-					this.showTooltip(id, vertexScreenY);
+					this.showTooltip(id, commitPointScreenY);
 				}
 			}, 100);
 		}
 	}
 
-	private vertexOut(event: MouseEvent) {
+	private commitPointHoverEnd(event: MouseEvent) {
 		if (event.target === null) return;
 		this.closeTooltip();
 	}
 
 	private showTooltip(id: number, vertexScreenY: number) {
-		if (this.tooltipVertex !== null) {
-			this.tooltipVertex.setAttribute('r', this.tooltipVertex.classList.contains('stashOuter') ? '5.5' : '5');
+		if (this.tooltipCommit !== null) {
+			this.tooltipCommit.setAttribute('r', this.tooltipCommit.classList.contains('stashOuter') ? '5.5' : '5');
 		}
+
+		const commit = this.commits[id];
 
 		const children = this.getAllChildren(id);
 		let heads: string[] = [], remotes: GG.GitCommitRemote[] = [], stashes: string[] = [], tags: string[] = [], childrenIncludesHead = false;
 		for (let i = 0; i < children.length; i++) {
-			let commit = this.commits[children[i]];
-			for (let j = 0; j < commit.heads.length; j++) heads.push(commit.heads[j]);
-			for (let j = 0; j < commit.remotes.length; j++) remotes.push(commit.remotes[j]);
-			for (let j = 0; j < commit.tags.length; j++) tags.push(commit.tags[j].name);
-			if (commit.stash !== null) stashes.push(commit.stash.selector.substring(5));
-			if (commit.hash === this.commitHead) childrenIncludesHead = true;
+			let child = children[i];
+			for (let j = 0; j < child.heads.length; j++) heads.push(child.heads[j]);
+			for (let j = 0; j < child.remotes.length; j++) remotes.push(child.remotes[j]);
+			for (let j = 0; j < child.tags.length; j++) tags.push(child.tags[j].name);
+			if (child.stash !== null) stashes.push(child.stash.selector.substring(5));
+			if (child.hash === this.commitHead) childrenIncludesHead = true;
 		}
 
 		const getLimitedRefs = (htmlRefs: string[]) => {
@@ -825,7 +921,7 @@ class Graph {
 			return htmlRefs.join('');
 		};
 
-		let html = '<div class="graphTooltipTitle">Commit ' + abbrevCommit(this.commits[id].hash) + '</div>';
+		let html = '<div class="graphTooltipTitle">Commit ' + commit.shortHash + '</div>';
 		if (this.commitHead !== null && typeof this.commitLookup[this.commitHead] === 'number') {
 			html += '<div class="graphTooltipSection">This commit is ' + (childrenIncludesHead ? '' : '<b><i>not</i></b> ') + 'included in <span class="graphTooltipRef">HEAD</span></div>';
 		}
@@ -847,9 +943,10 @@ class Graph {
 			html += '<div class="graphTooltipSection">Stashes: ' + getLimitedRefs(htmlRefs) + '</div>';
 		}
 
-		const point = this.vertices[id].getPoint(), color = 'var(--git-graph-color' + (this.vertices[id].getColour() % this.config.colours.length) + ')';
+		const point = commit as Point;
+		const color = 'var(--git-graph-color' + (commit.getColour(this.config)) + ')';
 		const anchor = document.createElement('div'), pointer = document.createElement('div'), content = document.createElement('div'), shadow = document.createElement('div');
-		const pixel: Pixel = {
+		const pixel: Point = {
 			x: point.x * this.config.grid.x + this.config.grid.offsetX,
 			y: point.y * this.config.grid.y + this.config.grid.offsetY + (this.expandedCommitIndex > -1 && id > this.expandedCommitIndex ? this.config.grid.expandY : 0)
 		};
@@ -905,9 +1002,9 @@ class Graph {
 			this.tooltipTimeout = null;
 		}
 
-		if (this.tooltipVertex !== null) {
-			this.tooltipVertex.setAttribute('r', this.tooltipVertex.classList.contains('stashOuter') ? '4.5' : '4');
-			this.tooltipVertex = null;
+		if (this.tooltipCommit !== null) {
+			this.tooltipCommit.setAttribute('r', this.tooltipCommit.classList.contains('stashOuter') ? '4.5' : '4');
+			this.tooltipCommit = null;
 		}
 	}
 }
